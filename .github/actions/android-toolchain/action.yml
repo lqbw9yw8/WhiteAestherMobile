@@ -47,7 +47,7 @@ runs:
     # alone, because bumping it here silently changes what the release is
     # built with.
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@1.88.0
+      uses: dtolnay/rust-toolchain@1.91.0
       with:
         components: ${{ inputs.rust-components }}
         targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
