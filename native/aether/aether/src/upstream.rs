@@ -102,9 +102,10 @@ impl Upstream {
 
         let (user, password) = match credentials {
             Some(pair) => match pair.split_once(':') {
-                Some((user, password)) => {
-                    (Some(percent_decode(user)), Some(percent_decode(password)))
-                }
+                Some((user, password)) => (
+                    Some(percent_decode(user)),
+                    Some(percent_decode(password)),
+                ),
                 None => (Some(percent_decode(pair)), None),
             },
             None => (None, None),
@@ -194,11 +195,7 @@ impl Upstream {
             let bound = read_reply(&mut control).await?;
 
             let relay = relay_address(bound, &self.host, self.port).await?;
-            let local = if relay.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
+            let local = if relay.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
             let socket = UdpSocket::bind(local).await?;
             crate::socketprotect::protect(&socket)?;
             socket.connect(relay).await?;
@@ -274,8 +271,7 @@ impl Upstream {
         stream.read_exact(&mut answer).await?;
         if answer[0] != 0x01 {
             return Err(AetherError::Other(
-                "the upstream proxy answered the password negotiation with the wrong version"
-                    .into(),
+                "the upstream proxy answered the password negotiation with the wrong version".into(),
             ));
         }
         if answer[1] != 0x00 {
@@ -294,8 +290,8 @@ impl Upstream {
 
         if let Some(user) = &self.user {
             let password = self.password.clone().unwrap_or_default();
-            let token =
-                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            let token = base64::engine::general_purpose::STANDARD
+                .encode(format!("{user}:{password}"));
             request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
         }
         request.push_str("\r\n");
@@ -321,8 +317,9 @@ impl Upstream {
             }
         }
 
-        let status = http_status(&head)
-            .ok_or_else(|| AetherError::Other("the upstream proxy answer was not http".into()))?;
+        let status = http_status(&head).ok_or_else(|| {
+            AetherError::Other("the upstream proxy answer was not http".into())
+        })?;
 
         if !(200..300).contains(&status) {
             return Err(AetherError::Other(format!(
@@ -446,11 +443,7 @@ pub async fn attach_detour(socket: &UdpSocket, peer: SocketAddr) -> Result<()> {
 }
 
 pub async fn bind_via_upstream(peer: SocketAddr) -> Result<(UdpSocket, SocketAddr)> {
-    let bind = if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
+    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
 
     let socket = UdpSocket::bind(bind).await?;
     // Every UDP socket the engine sends on now comes from here, which is why
@@ -603,7 +596,10 @@ pub fn decode_udp_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&buf[4..20]);
             let port = u16::from_be_bytes([buf[20], buf[21]]);
-            Some((SocketAddr::new(IpAddr::V6(octets.into()), port), 22))
+            Some((
+                SocketAddr::new(IpAddr::V6(octets.into()), port),
+                22,
+            ))
         }
         ATYP_NAME => {
             let length = *buf.get(4)? as usize;
@@ -673,11 +669,7 @@ async fn relay_address(bound: SocketAddr, host: &str, port: u16) -> Result<Socke
         return Ok(bound);
     }
 
-    let relay_port = if bound.port() == 0 {
-        port
-    } else {
-        bound.port()
-    };
+    let relay_port = if bound.port() == 0 { port } else { bound.port() };
 
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, relay_port));
@@ -859,10 +851,11 @@ mod tests {
         relay.send_to(b"ping", peer).await.unwrap();
 
         let mut out = vec![0u8; 1024];
-        let (len, origin) = tokio::time::timeout(Duration::from_secs(3), relay.recv_from(&mut out))
-            .await
-            .unwrap()
-            .unwrap();
+        let (len, origin) =
+            tokio::time::timeout(Duration::from_secs(3), relay.recv_from(&mut out))
+                .await
+                .unwrap()
+                .unwrap();
 
         assert_eq!(&out[..len], b"pong:ping");
         assert_eq!(origin, peer);
@@ -934,14 +927,8 @@ mod tests {
 
     #[test]
     fn an_http_status_line_is_read() {
-        assert_eq!(
-            http_status(b"HTTP/1.1 200 Connection established\r\n\r\n"),
-            Some(200)
-        );
-        assert_eq!(
-            http_status(b"HTTP/1.0 407 Proxy Authentication Required\r\n\r\n"),
-            Some(407)
-        );
+        assert_eq!(http_status(b"HTTP/1.1 200 Connection established\r\n\r\n"), Some(200));
+        assert_eq!(http_status(b"HTTP/1.0 407 Proxy Authentication Required\r\n\r\n"), Some(407));
         assert_eq!(http_status(b"NOTHTTP 200 OK\r\n\r\n"), None);
         assert_eq!(http_status(b""), None);
     }

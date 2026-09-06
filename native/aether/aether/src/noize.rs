@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rand::Rng;
 use rand::RngExt;
+use rand::Rng;
 use tokio::net::UdpSocket;
 
 #[derive(Debug, Clone)]
@@ -116,18 +116,18 @@ fn parse_cps(spec: &str) -> Vec<u8> {
                 if let Ok(decoded) = hex::decode(&hexstr) {
                     out.extend_from_slice(&decoded);
                 }
-            }
+            },
             "t" => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as u32)
                     .unwrap_or(0);
                 out.extend_from_slice(&ts.to_be_bytes());
-            }
+            },
             "n" => {
                 let nonce: u64 = rand::random();
                 out.extend_from_slice(&nonce.to_be_bytes());
-            }
+            },
             "r" => {
                 let len: usize = data.parse().unwrap_or(0).min(1024);
                 if len > 0 {
@@ -135,8 +135,8 @@ fn parse_cps(spec: &str) -> Vec<u8> {
                     rand::rng().fill_bytes(&mut r);
                     out.extend_from_slice(&r);
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         i = end + 1;

@@ -11,8 +11,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AetherError, Result};
 
-fn tcp_buf() -> usize {
-    crate::sysprofile::netstack_tcp_buf_bytes()
+fn tcp_rx_buf() -> usize {
+    crate::sysprofile::netstack_tcp_rx_buf_bytes()
+}
+
+fn tcp_tx_buf() -> usize {
+    crate::sysprofile::netstack_tcp_tx_buf_bytes()
 }
 
 fn udp_buf() -> usize {
@@ -38,7 +42,7 @@ const DROP_REPORT_STEP: usize = 512;
 const MAX_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn max_tcp_pending() -> usize {
-    tcp_buf().saturating_mul(2).max(64 * 1024)
+    tcp_rx_buf().saturating_mul(2).max(64 * 1024)
 }
 
 type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
@@ -103,13 +107,8 @@ impl Device for StackDevice {
 }
 
 pub enum Cmd {
-    OpenTcp {
-        dst: SocketAddr,
-        resp: OpenTcpResp,
-    },
-    OpenUdp {
-        resp: OpenUdpResp,
-    },
+    OpenTcp { dst: SocketAddr, resp: OpenTcpResp },
+    OpenUdp { resp: OpenUdpResp },
     SetAddrs {
         v4: Option<(Ipv4Addr, u8)>,
         v6: Option<(Ipv6Addr, u8)>,
@@ -149,10 +148,13 @@ impl TcpConn {
                 id: self.id,
                 data_in: self.data_in.clone(),
             },
-            std::mem::replace(&mut self.from_stack, {
-                let (_tx, rx) = mpsc::channel(1);
-                rx
-            }),
+            std::mem::replace(
+                &mut self.from_stack,
+                {
+                    let (_tx, rx) = mpsc::channel(1);
+                    rx
+                },
+            ),
         )
     }
 }
@@ -215,10 +217,13 @@ impl UdpConn {
                 id: self.id,
                 data_in: self.data_in.clone(),
             },
-            std::mem::replace(&mut self.from_stack, {
-                let (_tx, rx) = mpsc::channel(1);
-                rx
-            }),
+            std::mem::replace(
+                &mut self.from_stack,
+                {
+                    let (_tx, rx) = mpsc::channel(1);
+                    rx
+                },
+            ),
         )
     }
 }
@@ -381,7 +386,11 @@ fn routable_prefix_v6(p: u8) -> u8 {
     }
 }
 
-fn apply_addrs(iface: &mut Interface, v4: Option<(Ipv4Addr, u8)>, v6: Option<(Ipv6Addr, u8)>) {
+fn apply_addrs(
+    iface: &mut Interface,
+    v4: Option<(Ipv4Addr, u8)>,
+    v6: Option<(Ipv6Addr, u8)>,
+) {
     iface.update_ip_addrs(|addrs| {
         addrs.clear();
         if let Some((ip, p)) = v4 {
@@ -469,7 +478,7 @@ async fn run(
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let mut deferred: VecDeque<DataIn> = VecDeque::new();
+let mut deferred: VecDeque<DataIn> = VecDeque::new();
     let mut tx_dropped: usize = 0;
     let mut next_drop_report: usize = DROP_REPORT_STEP;
 
@@ -576,8 +585,8 @@ async fn sleep_opt(delay: Option<std::time::Duration>) {
 fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     match cmd {
         Cmd::OpenTcp { dst, resp } => {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_buf()]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_buf()]);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_rx_buf()]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_tx_buf()]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             socket.set_nagle_enabled(false);
 
@@ -626,13 +635,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             s.next_id += 1;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
-            s.udp_conns.insert(
-                id,
-                UdpState {
-                    handle,
-                    to_app: to_app_tx,
-                },
-            );
+            s.udp_conns.insert(id, UdpState { handle, to_app: to_app_tx });
 
             let conn = UdpConn {
                 id,
@@ -740,8 +743,7 @@ fn service_tcp(s: &mut NetStack) -> bool {
                     if sent > 0 {
                         st.pending.drain(0..sent);
                         if st.pending.len() * 4 < st.pending.capacity() {
-                            st.pending
-                                .shrink_to(max_tcp_pending().min(st.pending.capacity()));
+                            st.pending.shrink_to(max_tcp_pending().min(st.pending.capacity()));
                         }
                     }
                 }
@@ -1035,10 +1037,7 @@ mod tests {
             client_seq.wrapping_add(1),
             0x12,
         );
-        inbound_tx
-            .send(syn_ack)
-            .await
-            .expect("inbound accepts the syn-ack");
+        inbound_tx.send(syn_ack).await.expect("inbound accepts the syn-ack");
 
         let conn = tokio::time::timeout(StdDuration::from_secs(5), connect)
             .await
@@ -1060,7 +1059,7 @@ mod tests {
             }
         }
 
-        assert!(
+assert!(
             saw_teardown,
             "the netstack never closed the socket after the app went away, so it leaks"
         );
@@ -1091,10 +1090,7 @@ mod tests {
         let dropped = flush_tx(&mut stack, &outbound_tx);
 
         assert!(stack.device.tx.is_empty(), "the tx queue must be drained");
-        assert_eq!(
-            dropped, 8,
-            "everything past the channel capacity is dropped"
-        );
+        assert_eq!(dropped, 8, "everything past the channel capacity is dropped");
         assert_eq!(outbound_rx.len(), 2, "the channel keeps what fits");
     }
 }

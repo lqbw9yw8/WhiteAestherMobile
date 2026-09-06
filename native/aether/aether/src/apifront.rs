@@ -151,10 +151,7 @@ async fn candidates(host: &str) -> Vec<SocketAddr> {
     }
 
     if let Ok(resolved) = tokio::net::lookup_host((host, 443)).await {
-        for address in resolved
-            .filter(|entry| entry.is_ipv4())
-            .take(RESOLVED_SAMPLES)
-        {
+        for address in resolved.filter(|entry| entry.is_ipv4()).take(RESOLVED_SAMPLES) {
             if !list.contains(&address) {
                 list.push(address);
             }
@@ -227,11 +224,7 @@ fn dechunk(body: &str) -> String {
             Some(offset) => cursor + offset,
             None => break,
         };
-        let token = body[cursor..line_end]
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let token = body[cursor..line_end].split(';').next().unwrap_or("").trim();
         let size = match usize::from_str_radix(token, 16) {
             Ok(0) | Err(_) => break,
             Ok(value) => value,
@@ -257,9 +250,7 @@ async fn exchange(
         Some(proxy) => tokio::time::timeout(CONNECT_TIMEOUT, proxy.connect(address))
             .await
             .map_err(|_| AetherError::Api(format!("connect to {address} timed out")))?
-            .map_err(|e| {
-                AetherError::Api(format!("connect to {address} through the proxy: {e}"))
-            })?,
+            .map_err(|e| AetherError::Api(format!("connect to {address} through the proxy: {e}")))?,
         None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
             .await
             .map_err(|_| AetherError::Api(format!("connect to {address} timed out")))?
@@ -357,7 +348,8 @@ pub async fn fetch(request: &ApiRequest) -> Result<ApiResponse> {
         return Ok(response);
     }
 
-    Err(failure.unwrap_or_else(|| AetherError::Api("every camouflaged route failed".into())))
+    Err(failure
+        .unwrap_or_else(|| AetherError::Api("every camouflaged route failed".into())))
 }
 
 #[cfg(test)]

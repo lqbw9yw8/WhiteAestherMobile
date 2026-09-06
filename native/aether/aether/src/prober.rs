@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
@@ -32,31 +29,6 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
     "188.114.99.0/24",
     "162.159.36.0/24",
     "162.159.46.0/24",
-];
-
-/// The dedicated WARP ranges above are where an endpoint is most likely to be,
-/// but they are not the only place one lives: Cloudflare anycasts the MASQUE
-/// endpoint across its edge, and 104.25.202.52 -- squarely in the CDN range and
-/// in none of the ranges above -- was confirmed working from an Iranian network
-/// the scan had reported as empty. These are searched after the dedicated
-/// ranges, on 443 only, since that is the port the edge serves.
-pub const MASQUE_CDN_CIDRS_V4: &[&str] = &[
-    "104.16.0.0/16",
-    "104.17.0.0/16",
-    "104.18.0.0/16",
-    "104.19.0.0/16",
-    "104.24.0.0/16",
-    "104.25.0.0/16",
-    "104.26.0.0/16",
-    "104.27.0.0/16",
-    "172.64.0.0/16",
-    "172.66.0.0/16",
-    "172.67.0.0/16",
-    "103.21.244.0/22",
-    "103.22.200.0/22",
-    "141.101.64.0/18",
-    "190.93.240.0/20",
-    "198.41.128.0/17",
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
@@ -115,12 +87,7 @@ pub fn masque_cidrs_v6() -> Vec<&'static str> {
     prioritize(MASQUE_CIDRS_V6, MASQUE_ZT_CIDRS_V6)
 }
 
-pub const MASQUE_SEEDS_V6: &[&str] = &[
-    "2606:4700:d0::a29f:c602",
-    "2606:4700:d1::a29f:c602",
-    "2606:4700:d0::a29f:c601",
-    "2606:4700:d0::a29f:c001",
-];
+pub const MASQUE_SEEDS_V6: &[&str] = &["2606:4700:d0::a29f:c602", "2606:4700:d1::a29f:c602", "2606:4700:d0::a29f:c601", "2606:4700:d0::a29f:c001"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeResult {
@@ -190,15 +157,6 @@ impl ScanMode {
             ScanMode::Stealth => "stealth",
             ScanMode::Ironclad => "ironclad",
         }
-    }
-
-    /// Concurrency and overall budget, for the cross-prober comparison in
-    /// `lib.rs`. The two strategies are private and differently shaped; this is
-    /// the pair that decides how much of the space gets searched.
-    #[cfg(test)]
-    pub(crate) fn strategy_for_test(&self) -> (usize, Duration) {
-        let s = self.strategy();
-        (s.concurrency, s.overall_deadline)
     }
 
     fn strategy(&self) -> Strategy {
@@ -367,7 +325,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                             _ => pr,
                         });
                         found += 1;
-
+                        
                         if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
                             log::info!("[+] reached target of {} gateways, selecting best", st.target_successes);
                             if !st.quiet_after_first.is_zero() {
@@ -403,85 +361,6 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     }
 }
 
-pub async fn scan_gateways(
-    probe: &MasqueProbe,
-    mode: ScanMode,
-    limit: usize,
-    cancelled: &AtomicBool,
-) -> Result<Vec<ProbeResult>> {
-    let mut st = mode.strategy();
-    st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
-    let timeout = st.per_probe_timeout;
-    let mut effective_ip = probe.ip;
-    if probe.ip.want_v6() && !host_has_ipv6().await {
-        if probe.ip.want_v4() {
-            effective_ip = IpScan::V4;
-        } else {
-            return Err(AetherError::NoCleanEndpoint);
-        }
-    }
-    let candidates = build_candidates(&st, &probe.ports, effective_ip);
-    let ironclad = mode == ScanMode::Ironclad;
-    let stream = futures::stream::iter(
-        candidates
-            .into_iter()
-            .map(|(ip, port)| verify_one(probe, ip, port, timeout, ironclad)),
-    )
-    .buffer_unordered(st.concurrency);
-    tokio::pin!(stream);
-
-    let limit = limit.clamp(1, 16);
-    let deadline = Instant::now() + st.overall_deadline;
-    let mut quiet_until: Option<Instant> = None;
-    let mut results = Vec::new();
-
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(AetherError::Other("endpoint scan cancelled".into()));
-        }
-        let effective = quiet_until.map_or(deadline, |quiet| quiet.min(deadline));
-        let remaining = effective.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        tokio::select! {
-            item = stream.next() => {
-                match item {
-                    None => break,
-                    Some(None) => continue,
-                    Some(Some(result)) => {
-                        if !results.iter().any(|existing: &ProbeResult| {
-                            existing.ip == result.ip && existing.port == result.port
-                        }) {
-                            results.push(result);
-                            results.sort_by_key(|entry| entry.rtt);
-                            if results.len() >= limit {
-                                break;
-                            }
-                        }
-                        if st.quiet_after_first.is_zero() {
-                            break;
-                        }
-                        quiet_until = Some(Instant::now() + st.quiet_after_first);
-                    }
-                }
-            }
-            _ = tokio::time::sleep(remaining) => break,
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-    }
-
-    if cancelled.load(Ordering::Relaxed) {
-        return Err(AetherError::Other("endpoint scan cancelled".into()));
-    }
-    if results.is_empty() {
-        Err(AetherError::NoCleanEndpoint)
-    } else {
-        Ok(results)
-    }
-}
-
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,
@@ -504,10 +383,7 @@ async fn verify_one(
         };
         return match crate::tunnelping::masque_http_ping(&params, IRONCLAD_TCPING_TIMEOUT).await {
             Ok(rtt) => {
-                log::info!(
-                    "[+] ironclad verified {ip}:{port} real http round trip rtt={:?}",
-                    rtt
-                );
+                log::info!("[+] ironclad verified {ip}:{port} real http round trip rtt={:?}", rtt);
                 Some(ProbeResult { ip, port, rtt })
             }
             Err(e) => {
@@ -528,10 +404,7 @@ async fn verify_one(
             local_ipv4: probe.local_ipv4,
             quiet: true,
             pin_endpoint: true,
-            expected_pins: crate::consts::MASQUE_PINS
-                .iter()
-                .map(|p| p.to_vec())
-                .collect(),
+            expected_pins: crate::consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
             Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
@@ -570,10 +443,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
 
     let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
-    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
 
     if ip.want_v4() {
         for a in &seeds {
@@ -601,28 +471,6 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
                 }
             }
         }
-
-        // Edge ranges last, so a network where the dedicated ranges answer is
-        // unaffected and only one that finds nothing there pays for the wider
-        // sweep. Sampled more thinly, because they are far larger and a smaller
-        // share of them terminates MASQUE.
-        if st.sample_per_cidr > 0 {
-            let per = (st.sample_per_cidr / 4).max(8);
-            let cdn: Vec<Vec<Ipv4Addr>> = MASQUE_CDN_CIDRS_V4
-                .iter()
-                .map(|c| sample_cidr_v4(c, per))
-                .collect();
-            let cdn_max = cdn.iter().map(|v| v.len()).max().unwrap_or(0);
-            for i in 0..cdn_max {
-                for hosts in &cdn {
-                    if let Some(a) = hosts.get(i) {
-                        if seen.insert((IpAddr::V4(*a), 443)) {
-                            out.push((IpAddr::V4(*a), 443));
-                        }
-                    }
-                }
-            }
-        }
     }
 
     if ip.want_v6() {
@@ -631,11 +479,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
                 out.push((IpAddr::V6(*a), primary));
             }
         }
-        let per = if st.sample_per_cidr == 0 {
-            96
-        } else {
-            st.sample_per_cidr
-        };
+        let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
         let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
             .iter()
             .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
@@ -676,10 +520,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
 
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((
-        u32::from(ip.parse::<Ipv4Addr>().ok()?),
-        prefix.parse().ok()?,
-    ))
+    Some((u32::from(ip.parse::<Ipv4Addr>().ok()?), prefix.parse().ok()?))
 }
 
 fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
@@ -706,11 +547,7 @@ fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
         None => return Vec::new(),
     };
     let host_bits = 32u32.saturating_sub(prefix as u32);
-    let size = if host_bits >= 32 {
-        u32::MAX
-    } else {
-        1u32 << host_bits
-    };
+    let size = if host_bits >= 32 { u32::MAX } else { 1u32 << host_bits };
     if size <= 2 {
         return vec![Ipv4Addr::from(base)];
     }
@@ -733,10 +570,7 @@ fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
 
 fn parse_cidr_v6(cidr: &str) -> Option<(u128, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((
-        u128::from(ip.parse::<Ipv6Addr>().ok()?),
-        prefix.parse().ok()?,
-    ))
+    Some((u128::from(ip.parse::<Ipv6Addr>().ok()?), prefix.parse().ok()?))
 }
 
 fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
@@ -800,10 +634,7 @@ mod tests {
     #[test]
     fn without_a_team_the_range_order_is_left_alone() {
         std::env::remove_var("AETHER_TEAM");
-        assert_eq!(
-            prioritize(MASQUE_CIDRS_V4, MASQUE_ZT_CIDRS_V4),
-            MASQUE_CIDRS_V4.to_vec()
-        );
+        assert_eq!(prioritize(MASQUE_CIDRS_V4, MASQUE_ZT_CIDRS_V4), MASQUE_CIDRS_V4.to_vec());
     }
 
     #[test]
@@ -833,11 +664,7 @@ mod tests {
     }
 
     async fn quic_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
-        let bind = if peer.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
+        let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
         sock.connect(peer).await.ok()?;
         let local = sock.local_addr().ok()?;

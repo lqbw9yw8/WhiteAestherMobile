@@ -54,9 +54,7 @@ impl From<&Identity> for PersistedIdentity {
 fn decode_fixed<const N: usize>(field: &str, value: &str) -> Result<[u8; N]> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
-        .map_err(|e| {
-            AetherError::Other(format!("config field {field} is not valid base64: {e}"))
-        })?;
+        .map_err(|e| AetherError::Other(format!("config field {field} is not valid base64: {e}")))?;
 
     if decoded.len() != N {
         return Err(AetherError::Other(format!(
@@ -118,27 +116,6 @@ fn quarantine(path: &str) -> Option<PathBuf> {
         Ok(()) => Some(target),
         Err(_) => None,
     }
-}
-
-/// Reads an identity out of text, without a file behind it.
-///
-/// Import needs exactly the checks [`load`] makes -- the file parses, and the
-/// keys inside it are the right shape -- but on something the user handed us,
-/// before it is allowed anywhere near the identity in use. Sharing the parser
-/// is what stops the two drifting into disagreeing about what is valid.
-pub fn parse(text: &str) -> Result<Identity> {
-    let persisted: PersistedIdentity = toml::from_str(text)
-        .map_err(|e| AetherError::Other(format!("this is not a WhiteAesther identity: {e}")))?;
-    Identity::try_from(persisted)
-        .map_err(|e| AetherError::Other(format!("this identity is not usable: {e}")))
-}
-
-/// Writes an identity that came from somewhere else.
-///
-/// Same private permissions as one we provisioned, because it is the same
-/// secret: anyone holding it can present as this device.
-pub fn write_identity(path: &str, identity: &Identity) -> Result<()> {
-    save(path, identity)
 }
 
 pub fn load(path: &str) -> Result<Option<Identity>> {
@@ -228,17 +205,10 @@ fn write_private(path: &str, contents: &str) -> Result<()> {
 }
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {
-    write_private(path, &to_text(identity)?)
-}
-
-/// The on-disk form of an identity, as text.
-///
-/// Shared with export so what leaves the device is byte-for-byte what the
-/// engine would have written, and comes back through the same parser.
-pub fn to_text(identity: &Identity) -> Result<String> {
     let persisted = PersistedIdentity::from(identity);
-    toml::to_string_pretty(&persisted)
-        .map_err(|e| AetherError::Other(format!("config encode: {e}")))
+    let text = toml::to_string_pretty(&persisted)
+        .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
+    write_private(path, &text)
 }
 
 pub fn save_masque_creds(
@@ -306,9 +276,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         save(path_str, &sample()).expect("save should succeed");
-        let loaded = load(path_str)
-            .expect("load should succeed")
-            .expect("identity");
+        let loaded = load(path_str).expect("load should succeed").expect("identity");
 
         assert_eq!(loaded.device_id, "device-1");
         assert_eq!(loaded.access_token, "token-1");

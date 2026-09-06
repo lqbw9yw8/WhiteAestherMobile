@@ -359,10 +359,7 @@ async fn sign_in(settings: &TeamSettings) -> Result<String> {
                 "the supplied access token has expired; sign in again to get a fresh one".into(),
             ));
         }
-        log::info!(
-            "[+] using the access token supplied for team {}",
-            settings.team
-        );
+        log::info!("[+] using the access token supplied for team {}", settings.team);
         return Ok(token.clone());
     }
 
@@ -425,9 +422,7 @@ impl EmailSignIn {
     }
 
     pub async fn resend_code(&mut self) -> Result<()> {
-        if let Some(nonce) =
-            request_email_code(&self.client, &self.verify_url, &self.email, None).await?
-        {
+        if let Some(nonce) = request_email_code(&self.client, &self.verify_url, &self.email, None).await? {
             self.nonce = nonce;
         }
         Ok(())
