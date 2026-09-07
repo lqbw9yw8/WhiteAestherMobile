@@ -989,8 +989,8 @@ async fn quick_verify_masque_peer(identity: &account::Identity, peer: SocketAddr
         sni: consts::CONNECT_SNI.to_string(),
         authority: quic::default_authority().to_string(),
         path: quic::default_path().to_string(),
-        cert_pem: identity.cert_pem.clone(),
-        key_pem: identity.key_pem.clone(),
+        cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+        key_pem: std::sync::Arc::from(identity.key_pem.clone()),
         ech_config_list: None,
         noize: noize_config(),
         timeout: std::time::Duration::from_secs(5),
@@ -1003,8 +1003,8 @@ async fn quick_verify_masque_peer(identity: &account::Identity, peer: SocketAddr
             sni: consts::CONNECT_SNI.to_string(),
             authority: quic::default_authority().to_string(),
             path: quic::default_path().to_string(),
-            cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
+            cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+            key_pem: std::sync::Arc::from(identity.key_pem.clone()),
             local_ipv4: parse_local_v4(&identity.ipv4),
             quiet: true,
             pin_endpoint: true,
@@ -1025,8 +1025,8 @@ fn masque_probe(identity: &account::Identity, ip: prober::IpScan) -> prober::Mas
         sni: consts::CONNECT_SNI.to_string(),
         authority: quic::default_authority().to_string(),
         path: quic::default_path().to_string(),
-        cert_pem: identity.cert_pem.clone(),
-        key_pem: identity.key_pem.clone(),
+        cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+        key_pem: std::sync::Arc::from(identity.key_pem.clone()),
         ech_config_list: None,
         noize: noize_config(),
         ports: prober::MASQUE_PORTS.to_vec(),
@@ -1048,8 +1048,8 @@ async fn verify_masque_peer(
             sni: consts::CONNECT_SNI.to_string(),
             authority: quic::default_authority().to_string(),
             path: quic::default_path().to_string(),
-            cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
+            cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+            key_pem: std::sync::Arc::from(identity.key_pem.clone()),
             local_ipv4: parse_local_v4(&identity.ipv4),
             quiet: true,
             pin_endpoint: true,
@@ -1063,8 +1063,8 @@ async fn verify_masque_peer(
         sni: consts::CONNECT_SNI.to_string(),
         authority: quic::default_authority().to_string(),
         path: quic::default_path().to_string(),
-        cert_pem: identity.cert_pem.clone(),
-        key_pem: identity.key_pem.clone(),
+        cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+        key_pem: std::sync::Arc::from(identity.key_pem.clone()),
         ech_config_list: None,
         noize: noize_config(),
         timeout: std::time::Duration::from_secs(8),
@@ -1212,8 +1212,8 @@ async fn run_masque_tunnel(
         sni: consts::CONNECT_SNI.to_string(),
         authority: quic::default_authority().to_string(),
         path: quic::default_path().to_string(),
-        cert_pem: identity.cert_pem.clone(),
-        key_pem: identity.key_pem.clone(),
+        cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+        key_pem: std::sync::Arc::from(identity.key_pem.clone()),
         ech_config_list: ech,
         noize: noize_config(),
         local_ipv4: parse_local_v4(&identity.ipv4),
@@ -1255,8 +1255,8 @@ async fn run_masque_tunnel(
             sni: consts::CONNECT_SNI.to_string(),
             authority: quic::default_authority().to_string(),
             path: quic::default_path().to_string(),
-            cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
+            cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+            key_pem: std::sync::Arc::from(identity.key_pem.clone()),
             local_ipv4: parse_local_v4(&identity.ipv4),
             quiet: false,
             pin_endpoint: true,
@@ -2418,6 +2418,28 @@ impl EmbeddedConfig {
 /// instead of silently misread.
 const IDENTITY_EXPORT_VERSION: u32 = 1;
 
+/// Migrates an on-disk identity file written by a pre-MASQUE-split build into
+/// the current schema, before [`export_identity`] reads it.
+///
+/// NOT IMPLEMENTED. The original definition of this function was not present
+/// in the `lib.rs` this file was patched from, and reconstructing it requires
+/// the legacy on-disk identity schema, which is defined in `config.rs` (not
+/// available when this patch was made). Writing a guessed migration here
+/// would risk silently corrupting or discarding real certificate/key
+/// material on export, so this fails loudly instead of pretending to work.
+///
+/// To finish this: supply `config.rs` (and any prior identity-schema
+/// history), then replace this body with the real migration logic.
+fn adopt_legacy_masque_identity(_config_path: &str) -> Result<()> {
+    Err(AetherError::Other(
+        "adopt_legacy_masque_identity is not implemented in this build: the legacy identity \
+         migration logic was missing from the source and was not guessed at during the fix for \
+         this file. Identity export is blocked until this is implemented against the real \
+         legacy schema in config.rs."
+            .into(),
+    ))
+}
+
 pub fn export_identity(base_config: &str) -> Result<String> {
     let shared = warp_config_path(base_config);
     adopt_legacy_masque_identity(&shared)?;
@@ -2703,7 +2725,7 @@ async fn run_warp_in_warp_embedded(
 ) -> Result<()> {
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
     let (outer_stack, mut outer_exit) =
-        establish_wg(primary, peer, WIREGUARD_MTU, true, 5, "outer").await?;
+        establish_wg(primary, peer, TUNNEL_MTU, true, 5, "outer").await?;
 
     let (forwarder, _forwarder_guard) = spawn_udp_forwarder(&outer_stack, peer).await?;
     log::info!("[+] inner endpoint tunneled through outer warp via {forwarder}");
@@ -2900,7 +2922,7 @@ async fn run_wireguard_tunnel_embedded(
             let stack = netstack::spawn(
                 &identity.ipv4,
                 &identity.ipv6,
-                WIREGUARD_MTU,
+                TUNNEL_MTU,
                 inbound_rx,
                 outbound_tx,
             )?;
@@ -3009,8 +3031,8 @@ async fn run_masque_tunnel_embedded(
         sni: consts::CONNECT_SNI.to_string(),
         authority: quic::default_authority().to_string(),
         path: quic::default_path().to_string(),
-        cert_pem: identity.cert_pem.clone(),
-        key_pem: identity.key_pem.clone(),
+        cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+        key_pem: std::sync::Arc::from(identity.key_pem.clone()),
         ech_config_list: ech,
         noize: noize_config(),
         local_ipv4: parse_local_v4(&identity.ipv4),
@@ -3031,8 +3053,8 @@ async fn run_masque_tunnel_embedded(
             sni: consts::CONNECT_SNI.to_string(),
             authority: quic::default_authority().to_string(),
             path: quic::default_path().to_string(),
-            cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
+            cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
+            key_pem: std::sync::Arc::from(identity.key_pem.clone()),
             local_ipv4: parse_local_v4(&identity.ipv4),
             quiet: false,
             pin_endpoint: true,
@@ -3070,7 +3092,7 @@ async fn run_masque_tunnel_embedded(
             let stack = netstack::spawn(
                 &identity.ipv4,
                 &identity.ipv6,
-                MASQUE_MTU,
+                masque_tunnel_mtu(),
                 inbound_rx,
                 outbound_tx,
             )?;
@@ -3383,5 +3405,3 @@ async fn hunt_wg_peer_sweep(
     }
     Err(last)
 }
-
-
