@@ -19,6 +19,9 @@ const REP_OK: u8 = 0x00;
 const REP_GENERAL: u8 = 0x01;
 const REP_NOT_ALLOWED: u8 = 0x02;
 const REP_NOT_SUPPORTED: u8 = 0x07;
+const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USERPASS: u8 = 0x02;
+const METHOD_NO_ACCEPTABLE: u8 = 0xff;
 
 #[derive(Debug)]
 enum Target {
@@ -52,6 +55,40 @@ pub fn set_gateway_proxy(address: &str) {
         }
         Err(_) => log::warn!("[-] ignoring malformed gateway proxy address {trimmed}"),
     }
+}
+
+/// Credentials a client must present before this listener does anything else.
+#[derive(Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Who may complete the SOCKS5 handshake on this listener.
+///
+/// `None` means no password is demanded -- the default, and the only
+/// sensible choice for a loopback-only listener.
+#[derive(Clone, Default)]
+pub struct Access {
+    pub credentials: Option<Credentials>,
+}
+
+static ACCESS: std::sync::OnceLock<std::sync::RwLock<Access>> = std::sync::OnceLock::new();
+
+fn access_state() -> &'static std::sync::RwLock<Access> {
+    ACCESS.get_or_init(|| std::sync::RwLock::new(Access::default()))
+}
+
+/// Installs the access policy every future connection to this listener is
+/// checked against. Call before the listener is bound.
+pub fn configure_access(access: Access) {
+    if let Ok(mut current) = access_state().write() {
+        *current = access;
+    }
+}
+
+fn configured_credentials() -> Option<Credentials> {
+    access_state().read().ok()?.credentials.clone()
 }
 
 static ROUTES: std::sync::OnceLock<RuleSet> = std::sync::OnceLock::new();
@@ -116,6 +153,14 @@ pub(crate) fn proxy_connect_succeeded(head: &[u8]) -> Option<bool> {
 
 pub(crate) fn warn_if_world_reachable(kind: &str, listen: SocketAddr) {
     if listen.ip().is_loopback() {
+        return;
+    }
+    if configured_credentials().is_some() {
+        log::warn!(
+            "[!] the {kind} listener is bound to {listen}, which is reachable from outside this \
+             machine. A username and password are required, but anyone on the network can still \
+             reach the listener and try. Bind it to 127.0.0.1 unless you intend to share it."
+        );
         return;
     }
     log::warn!(
@@ -220,7 +265,41 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let nmethods = prefix[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[VER, 0x00]).await?;
+
+    let Some(credentials) = configured_credentials() else {
+        sock.write_all(&[VER, METHOD_NO_AUTH]).await?;
+        return Ok(());
+    };
+
+    if !methods.contains(&METHOD_USERPASS) {
+        sock.write_all(&[VER, METHOD_NO_ACCEPTABLE]).await?;
+        return Err(AetherError::Other(
+            "the socks5 client did not offer username/password authentication".into(),
+        ));
+    }
+    sock.write_all(&[VER, METHOD_USERPASS]).await?;
+
+    // RFC 1929 sub-negotiation: [ver, ulen, uname.., plen, passwd..].
+    let mut sub_head = [0u8; 2];
+    sock.read_exact(&mut sub_head).await?;
+    if sub_head[0] != 0x01 {
+        return Err(AetherError::Other("bad auth sub-negotiation version".into()));
+    }
+    let mut uname = vec![0u8; sub_head[1] as usize];
+    sock.read_exact(&mut uname).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut passwd = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut passwd).await?;
+
+    let accepted =
+        uname == credentials.username.as_bytes() && passwd == credentials.password.as_bytes();
+    sock.write_all(&[0x01, if accepted { 0x00 } else { 0x01 }]).await?;
+    if !accepted {
+        return Err(AetherError::Other(
+            "the socks5 client sent the wrong username or password".into(),
+        ));
+    }
     Ok(())
 }
 

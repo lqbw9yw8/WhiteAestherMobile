@@ -1018,6 +1018,61 @@ async fn quick_verify_masque_peer(identity: &account::Identity, peer: SocketAddr
     quic::verify_masque(&vp).await.is_ok()
 }
 
+/// The MASQUE probe config for one identity: everything a gateway scan needs
+/// to try a candidate, independent of which candidate that ends up being.
+fn masque_probe(identity: &account::Identity, ip: prober::IpScan) -> prober::MasqueProbe {
+    prober::MasqueProbe {
+        sni: consts::CONNECT_SNI.to_string(),
+        authority: quic::default_authority().to_string(),
+        path: quic::default_path().to_string(),
+        cert_pem: identity.cert_pem.clone(),
+        key_pem: identity.key_pem.clone(),
+        ech_config_list: None,
+        noize: noize_config(),
+        ports: prober::MASQUE_PORTS.to_vec(),
+        ip,
+        local_ipv4: parse_local_v4(&identity.ipv4),
+    }
+}
+
+/// Thoroughly verifies one specific MASQUE peer and times it, for the
+/// "test this endpoint" JNI call -- unlike [`quick_verify_masque_peer`],
+/// which only needs a yes/no answer for automatic reconnection.
+async fn verify_masque_peer(
+    identity: &account::Identity,
+    peer: SocketAddr,
+) -> Result<std::time::Duration> {
+    if masque_h2::enabled() {
+        let cfg = masque_h2::H2TunnelConfig {
+            peer: masque_h2::h2_peer(peer),
+            sni: consts::CONNECT_SNI.to_string(),
+            authority: quic::default_authority().to_string(),
+            path: quic::default_path().to_string(),
+            cert_pem: identity.cert_pem.clone(),
+            key_pem: identity.key_pem.clone(),
+            local_ipv4: parse_local_v4(&identity.ipv4),
+            quiet: true,
+            pin_endpoint: true,
+            expected_pins: consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
+        };
+        return masque_h2::verify_h2(&cfg, std::time::Duration::from_secs(8)).await;
+    }
+
+    let vp = quic::VerifyParams {
+        peer,
+        sni: consts::CONNECT_SNI.to_string(),
+        authority: quic::default_authority().to_string(),
+        path: quic::default_path().to_string(),
+        cert_pem: identity.cert_pem.clone(),
+        key_pem: identity.key_pem.clone(),
+        ech_config_list: None,
+        noize: noize_config(),
+        timeout: std::time::Duration::from_secs(8),
+        local_ipv4: parse_local_v4(&identity.ipv4),
+    };
+    quic::verify_masque(&vp).await
+}
+
 async fn want_quick_reconnect(cached: &lastconn::LastConnection) -> bool {
     match std::env::var("AETHER_QUICK_RECONNECT").as_deref() {
         Ok("1") | Ok("true") | Ok("yes") | Ok("on") => return true,
@@ -1293,35 +1348,6 @@ fn wg_profile_candidates() -> Vec<(String, aethernoize::AetherNoizeConfig)> {
         .collect()
 }
 
-async fn hunt_wg_peer_with_profile(
-    identity: &account::Identity,
-    mode_str: &str,
-    ip: prober::IpScan,
-    profile: aethernoize::AetherNoizeConfig,
-    excluded: &HashSet<SocketAddr>,
-) -> Result<SocketAddr> {
-    let mode = wg_prober::WgScanMode::parse(mode_str);
-    let private_key = identity.private_key_bytes()?;
-    let peer_public = identity.peer_public_key_bytes()?;
-
-    let probe = wg_prober::WgProbe {
-        private_key: std::sync::Arc::new(private_key),
-        peer_public_key: std::sync::Arc::new(peer_public),
-        client_id: identity.client_id,
-        local_ipv4: identity
-            .ipv4
-            .parse()
-            .map_err(|_| AetherError::Other("invalid ipv4".into()))?,
-        aethernoize: profile,
-        ports: wireguard::WG_PORTS.to_vec(),
-        ip,
-        excluded: excluded.clone(),
-    };
-
-    let best = wg_prober::hunt_best_wg_endpoint(&probe, mode).await?;
-    Ok(SocketAddr::new(best.ip, best.port))
-}
-
 fn wg_reconnect_delay() -> std::time::Duration {
     let secs = std::env::var("AETHER_WG_RECONNECT_SECS")
         .ok()
@@ -1338,35 +1364,6 @@ fn wg_endpoint_cooldown() -> std::time::Duration {
         .filter(|&v| v > 0)
         .unwrap_or(300);
     std::time::Duration::from_secs(secs)
-}
-
-async fn hunt_wg_peer(
-    identity: &account::Identity,
-    candidates: &[(String, aethernoize::AetherNoizeConfig)],
-    mode_str: &str,
-    ip: prober::IpScan,
-    excluded: &HashSet<SocketAddr>,
-) -> Result<(SocketAddr, aethernoize::AetherNoizeConfig, String)> {
-    let multi = candidates.len() > 1;
-    for (name, profile) in candidates {
-        log::info!(
-            "[*] hunting for a working WireGuard endpoint (handshake + data-plane verification, aethernoize='{name}')"
-        );
-        match hunt_wg_peer_with_profile(identity, mode_str, ip, profile.clone(), excluded).await {
-            Ok(peer) => {
-                log::info!("[+] selected WireGuard endpoint {peer} using aethernoize profile '{name}'");
-                return Ok((peer, profile.clone(), name.clone()));
-            }
-            Err(e) => {
-                if multi {
-                    log::warn!("[-] profile '{name}' found no data-plane endpoint: {e}; trying next profile");
-                } else {
-                    log::warn!("[-] profile '{name}' found no data-plane endpoint: {e}");
-                }
-            }
-        }
-    }
-    Err(AetherError::NoCleanEndpoint)
 }
 
 async fn run_wireguard(identity: account::Identity, listen: SocketAddr, lastconn_path: String) -> Result<()> {
@@ -1748,6 +1745,77 @@ async fn establish_wg(
     });
 
     Ok((stack, exit))
+}
+
+/// A validated WireGuard session exposed as raw packet channels instead of a
+/// netstack -- for a hop whose traffic comes from somewhere other than a
+/// local TUN or SOCKS listener, such as the inner leg of warp-in-warp, which
+/// is fed by [`spawn_udp_forwarder`] rather than [`netstack::spawn`].
+struct WgChannels {
+    inbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    exit: TunnelExit,
+}
+
+async fn establish_wg_channels(
+    identity: &account::Identity,
+    peer: SocketAddr,
+    obfuscate: bool,
+    keepalive: u16,
+    label: &'static str,
+) -> Result<WgChannels> {
+    let private_key = identity.private_key_bytes()?;
+    let peer_public = identity.peer_public_key_bytes()?;
+    let ipv4: std::net::Ipv4Addr = identity
+        .ipv4
+        .parse()
+        .map_err(|_| AetherError::Other("invalid ipv4".into()))?;
+
+    let profile = if obfuscate {
+        aethernoize_config()
+    } else {
+        aethernoize::from_profile("off")
+    };
+
+    log::info!("[*] [{label}] validating WireGuard tunnel with {peer} (handshake + data-plane)...");
+    let (_, session) = wireguard::verify_endpoint_keep_session(
+        peer,
+        private_key,
+        peer_public,
+        identity.client_id,
+        ipv4,
+        &profile,
+        wg_tunnel_validate_timeout(),
+        Some(keepalive),
+    )
+    .await
+    .map_err(|e| AetherError::Other(format!("[{label}] tunnel failed validation: {e}")))?;
+    log::info!("[+] [{label}] wireguard tunnel validated (end-to-end data confirmed)");
+
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+
+    let tunnel =
+        wireguard::WgTunnel::from_established(session, std::sync::Arc::new(profile), inbound_tx, ipv4);
+
+    let exit = tokio::spawn(async move {
+        match tunnel.run(outbound_rx).await {
+            Ok(()) => {
+                log::warn!("[-] [{label}] wireguard tunnel closed");
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("[-] [{label}] wireguard tunnel exited: {e}");
+                Err(AetherError::Other(format!("[{label}] {e}")))
+            }
+        }
+    });
+
+    Ok(WgChannels {
+        inbound_rx,
+        outbound_tx,
+        exit,
+    })
 }
 
 struct TaskGuard(Vec<tokio::task::AbortHandle>);
@@ -2309,6 +2377,47 @@ pub enum EmbeddedEndpoint {
 }
 
 
+impl EmbeddedConfig {
+    /// Path to the primary identity. Android always hands this in explicitly,
+    /// so unlike the CLI there is no env-var override or team scope to apply
+    /// here -- that happens inside `load_or_provision_*` for whichever
+    /// protocol is actually selected.
+    fn identity_path(&self) -> String {
+        self.config_path.clone()
+    }
+
+    /// Path to the secondary (inner) identity used by warp-in-warp.
+    fn secondary_identity_path(&self) -> String {
+        derive_sibling_path(&self.config_path, "secondary")
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::parse(&self.protocol)
+    }
+
+    /// Copies everything but the peer, so a known-good endpoint can be
+    /// re-verified for the aethernoize profile that currently works without
+    /// re-running discovery.
+    fn clone_with_peer(&self, peer: SocketAddr) -> EmbeddedConfig {
+        EmbeddedConfig {
+            config_path: self.config_path.clone(),
+            listen: self.listen,
+            peer: Some(peer),
+            peer_fallback: self.peer_fallback,
+            scan_mode: self.scan_mode.clone(),
+            ip_scan: self.ip_scan.clone(),
+            protocol: self.protocol.clone(),
+            access: self.access.clone(),
+        }
+    }
+}
+
+
+/// Format version stamped into every exported identity file and checked on
+/// import, so a file from a future, incompatible export format is rejected
+/// instead of silently misread.
+const IDENTITY_EXPORT_VERSION: u32 = 1;
+
 pub fn export_identity(base_config: &str) -> Result<String> {
     let shared = warp_config_path(base_config);
     adopt_legacy_masque_identity(&shared)?;
@@ -2355,15 +2464,16 @@ pub fn import_identity(base_config: &str, payload: &str) -> Result<()> {
     };
 
     let shared = warp_config_path(base_config);
-    config::write_identity(&shared, &identity)?;
+    config::save(&shared, &identity)?;
     if let Some(secondary) = secondary {
-        config::write_identity(&derive_sibling_path(&shared, "secondary"), &secondary)?;
+        config::save(&derive_sibling_path(&shared, "secondary"), &secondary)?;
     }
     log::info!("[+] imported identity for device {}", identity.device_id);
     Ok(())
 }
 
 
+#[derive(serde::Deserialize)]
 struct ExportEnvelope {
     version: u32,
     identity: toml::Value,
@@ -3051,88 +3161,6 @@ fn embedded_tunnel_result(
 }
 
 
-async fn run_gool(
-    primary: account::Identity,
-    secondary: account::Identity,
-    listen: SocketAddr,
-) -> Result<()> {
-    let mut last_peer: Option<SocketAddr> = None;
-    let mut last_inner: Option<SocketAddr> = None;
-    let mut consecutive_fails: u32 = 0;
-    const MAX_CONSECUTIVE_FAILS: u32 = 2;
-
-    loop {
-        let peer = if consecutive_fails < MAX_CONSECUTIVE_FAILS {
-            if let Some(p) = last_peer {
-                Some(p)
-            } else {
-                None
-            }
-        } else {
-            if let Some(p) = last_peer {
-                log::warn!(
-                    "[-] outer endpoint {p} failed {consecutive_fails} times in a row; blacklisting and rescanning"
-                );
-            }
-            None
-        };
-
-        let pair = match peer {
-            Some(p) => Some((p, last_inner)),
-            None => {
-                let mode_str = select_scan_mode_str().await;
-                let ip = select_ip_version().await;
-                match select_wg_peers(&primary, &mode_str, ip, 2).await {
-                    Ok(found) => {
-                        consecutive_fails = 0;
-                        let outer = found[0];
-                        let inner = found.get(1).copied();
-                        Some((outer, inner))
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[-] no usable outer WARP endpoint found: {e}; rescanning shortly"
-                        );
-                        tokio::time::sleep(wg_reconnect_delay()).await;
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let (peer, inner_peer) = match pair {
-            Some(pair) => pair,
-            None => continue,
-        };
-
-        let inner_peer = match inner_peer {
-            Some(inner) => inner,
-            None => {
-                log::warn!(
-                    "[-] the scan only turned up {peer}, so warp-in-warp would use one edge twice; rescanning"
-                );
-                last_peer = None;
-                last_inner = None;
-                tokio::time::sleep(wg_reconnect_delay()).await;
-                continue;
-            }
-        };
-
-        log::info!("[+] using cloudflare edge {peer} (outer) and {inner_peer} (inner)");
-        last_peer = Some(peer);
-        last_inner = Some(inner_peer);
-
-        match run_warp_in_warp(primary.clone(), secondary.clone(), peer, inner_peer, listen).await {
-            Ok(()) => log::warn!("[-] gool tunnel closed; reconnecting"),
-            Err(e) => log::warn!("[-] gool tunnel ended: {e}; reconnecting"),
-        }
-        consecutive_fails += 1;
-
-        tokio::time::sleep(wg_reconnect_delay()).await;
-    }
-}
-
-
 fn wg_hunt_budget() -> std::time::Duration {
     std::env::var("AETHER_WG_HUNT_BUDGET_SECS")
         .ok()
@@ -3141,6 +3169,16 @@ fn wg_hunt_budget() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(210))
 }
 
+
+/// Overall time budget for the documented-anchor shortcut before
+/// [`hunt_wg_peer`] falls back to the full address-pool sweep. Short on
+/// purpose: it only exists to skip the sweep when a well-known edge answers
+/// immediately, so it should never itself become the slow path.
+const ANCHOR_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Per-probe timeout while trying the documented anchors -- see the "three
+/// seconds each" budget math in [`hunt_wg_anchors`].
+const ANCHOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 async fn hunt_wg_anchors(
     identity: &account::Identity,
@@ -3298,6 +3336,52 @@ async fn hunt_wg_peer(
             Err(no_wireguard_endpoint())
         }
     }
+}
+
+fn no_wireguard_endpoint() -> AetherError {
+    AetherError::NoCleanEndpoint
+}
+
+/// The fallback sweep of the sampled address pool, tried under every
+/// candidate aethernoize profile in turn until one of them finds a peer that
+/// answers -- the slow path [`hunt_wg_anchors`] exists to usually avoid.
+async fn hunt_wg_peer_sweep(
+    identity: &account::Identity,
+    candidates: &[(String, aethernoize::AetherNoizeConfig)],
+    mode_str: &str,
+    ip: prober::IpScan,
+    excluded: &HashSet<SocketAddr>,
+) -> Result<(SocketAddr, aethernoize::AetherNoizeConfig, String)> {
+    let private_key = std::sync::Arc::new(identity.private_key_bytes()?);
+    let peer_public_key = std::sync::Arc::new(identity.peer_public_key_bytes()?);
+    let local_ipv4: std::net::Ipv4Addr = identity
+        .ipv4
+        .parse()
+        .map_err(|_| AetherError::Other("invalid ipv4".into()))?;
+    let mode = wg_prober::WgScanMode::parse(mode_str);
+
+    let mut last = no_wireguard_endpoint();
+    for (name, profile) in candidates {
+        let probe = wg_prober::WgProbe {
+            private_key: private_key.clone(),
+            peer_public_key: peer_public_key.clone(),
+            client_id: identity.client_id,
+            local_ipv4,
+            aethernoize: profile.clone(),
+            ports: wireguard::WG_PORTS.to_vec(),
+            ip,
+            excluded: excluded.clone(),
+        };
+        match wg_prober::hunt_best_wg_endpoint(&probe, mode).await {
+            Ok(result) => {
+                let peer = SocketAddr::new(result.ip, result.port);
+                log::info!("[+] found {peer} under aethernoize profile '{name}'");
+                return Ok((peer, profile.clone(), name.clone()));
+            }
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
 }
 
 

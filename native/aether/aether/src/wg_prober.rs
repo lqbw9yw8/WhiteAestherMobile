@@ -271,6 +271,122 @@ pub async fn hunt_wg_endpoints(
     Ok(picked.into_iter().take(want).collect())
 }
 
+/// How often a cancellable scan re-checks its cancellation flag while it
+/// would otherwise be waiting on the probe stream or the deadline.
+const SCAN_CANCEL_POLL: Duration = Duration::from_millis(250);
+
+/// Like [`hunt_wg_endpoints`], but for the interactive "browse the scan
+/// results" flow: it can be stopped early via `cancelled`, set from the
+/// Android side when the person backs out of the scan screen.
+pub async fn scan_wg_endpoints(
+    probe: &WgProbe,
+    mode: WgScanMode,
+    limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<WgProbeResult>> {
+    let want = limit.max(1);
+    let mut st = mode.strategy();
+    st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
+    let timeout = st.per_probe_timeout;
+    let mut effective_ip = probe.ip;
+    if probe.ip.want_v6() && !crate::prober::host_has_ipv6().await {
+        if probe.ip.want_v4() {
+            log::warn!("[-] host has no IPv6 route; falling back to IPv4-only scan");
+            effective_ip = IpScan::V4;
+        } else {
+            log::warn!("[-] host has no IPv6 route; IPv6 scan needs native IPv6 connectivity");
+            return Err(AetherError::NoCleanEndpoint);
+        }
+    }
+    let candidates = build_wg_candidates(&st, &probe.ports, effective_ip, &probe.excluded);
+
+    log::info!(
+        "[*] wireguard scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
+        mode.label(),
+        effective_ip.label(),
+        candidates.len(),
+        probe.ports,
+        st.concurrency,
+        st.per_probe_timeout,
+        st.overall_deadline,
+    );
+
+    let ironclad = mode == WgScanMode::Ironclad;
+
+    let stream = futures::stream::iter(
+        candidates
+            .into_iter()
+            .map(|(ip, port)| verify_one_wg(probe, ip, port, timeout, ironclad)),
+    )
+    .buffer_unordered(st.concurrency);
+    tokio::pin!(stream);
+
+    st.early_exit_first = false;
+    st.target_successes = st.target_successes.max(want * 3);
+
+    let deadline = Instant::now() + st.overall_deadline;
+    let mut verified: Vec<WgProbeResult> = Vec::new();
+    let mut found = 0usize;
+    let mut quiet_until: Option<Instant> = None;
+
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("[*] scan cancelled by caller");
+            break;
+        }
+
+        let effective = match quiet_until {
+            Some(q) => q.min(deadline),
+            None => deadline,
+        };
+        let remaining = effective.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if !verified.is_empty() {
+                if quiet_until.is_some() {
+                    log::info!("[+] no new endpoints recently, finalizing selection");
+                } else {
+                    log::warn!("[-] scan deadline reached");
+                }
+            } else {
+                log::warn!("[-] scan deadline reached with no endpoint");
+            }
+            break;
+        }
+
+        tokio::select! {
+            item = stream.next() => {
+                match item {
+                    None => break,
+                    Some(None) => continue,
+                    Some(Some(pr)) => {
+                        log::info!("[+] wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                        verified.push(pr);
+                        found += 1;
+
+                        if distinct_by_ip(&verified).len() >= want {
+                            log::info!("[+] found {want} endpoints on separate addresses");
+                            break;
+                        }
+                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
+                            log::info!("[+] reached target of {} endpoints, selecting best", st.target_successes);
+                            if !st.quiet_after_first.is_zero() {
+                                quiet_until = Some(Instant::now() + st.quiet_after_first);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(remaining.min(SCAN_CANCEL_POLL)) => {
+                continue;
+            }
+        }
+    }
+
+    Ok(distinct_by_ip(&verified).into_iter().take(want).collect())
+}
+
 fn distinct_by_ip(found: &[WgProbeResult]) -> Vec<WgProbeResult> {
     let mut sorted = found.to_vec();
     sorted.sort_by_key(|pr| pr.rtt);
@@ -742,4 +858,9 @@ pub fn begin_probe_pass() {
 /// One line saying how the pass failed, for the diagnostics report.
 pub fn probe_pass_summary() -> String {
     PROBE_TALLY.describe()
+}
+
+/// Files one failed probe into the current pass's tally.
+pub fn record_probe_failure(error: &AetherError) {
+    PROBE_TALLY.record(error);
 }

@@ -361,6 +361,121 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     }
 }
 
+/// How often a cancellable scan re-checks its cancellation flag while it
+/// would otherwise be waiting on the probe stream or the deadline.
+const SCAN_CANCEL_POLL: Duration = Duration::from_millis(250);
+
+/// Like [`hunt_best_gateway`], but for the interactive "browse the scan
+/// results" flow: it can be stopped early via `cancelled`, set from the
+/// Android side when the person backs out of the scan screen.
+pub async fn scan_gateways(
+    probe: &MasqueProbe,
+    mode: ScanMode,
+    limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<ProbeResult>> {
+    let want = limit.max(1);
+    let mut st = mode.strategy();
+    st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
+    let timeout = st.per_probe_timeout;
+    let mut effective_ip = probe.ip;
+    if probe.ip.want_v6() && !host_has_ipv6().await {
+        if probe.ip.want_v4() {
+            log::warn!("[-] host has no IPv6 route; falling back to IPv4-only scan");
+            effective_ip = IpScan::V4;
+        } else {
+            log::warn!("[-] host has no IPv6 route; IPv6 scan needs native IPv6 connectivity");
+            return Err(AetherError::NoCleanEndpoint);
+        }
+    }
+    let candidates = build_candidates(&st, &probe.ports, effective_ip);
+
+    log::info!(
+        "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
+        mode.label(),
+        effective_ip.label(),
+        candidates.len(),
+        probe.ports,
+        st.concurrency,
+        st.per_probe_timeout,
+        st.overall_deadline,
+    );
+
+    let ironclad = mode == ScanMode::Ironclad;
+
+    let stream = futures::stream::iter(
+        candidates
+            .into_iter()
+            .map(|(ip, port)| verify_one(probe, ip, port, timeout, ironclad)),
+    )
+    .buffer_unordered(st.concurrency);
+    tokio::pin!(stream);
+
+    let deadline = Instant::now() + st.overall_deadline;
+    let mut found_results: Vec<ProbeResult> = Vec::new();
+    let mut found = 0usize;
+    let mut quiet_until: Option<Instant> = None;
+
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("[*] scan cancelled by caller");
+            break;
+        }
+
+        let effective = match quiet_until {
+            Some(q) => q.min(deadline),
+            None => deadline,
+        };
+        let remaining = effective.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if !found_results.is_empty() {
+                if quiet_until.is_some() {
+                    log::info!("[+] no new gateways recently, finalizing selection");
+                } else {
+                    log::warn!("[-] scan deadline reached");
+                }
+            } else {
+                log::warn!("[-] scan deadline reached with no gateway");
+            }
+            break;
+        }
+
+        tokio::select! {
+            item = stream.next() => {
+                match item {
+                    None => break,
+                    Some(None) => continue,
+                    Some(Some(pr)) => {
+                        log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                        found_results.push(pr);
+                        found += 1;
+
+                        if found_results.len() >= want {
+                            log::info!("[+] found {want} gateways");
+                            break;
+                        }
+                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
+                            log::info!("[+] reached target of {} gateways, selecting best", st.target_successes);
+                            if !st.quiet_after_first.is_zero() {
+                                quiet_until = Some(Instant::now() + st.quiet_after_first);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(remaining.min(SCAN_CANCEL_POLL)) => {
+                continue;
+            }
+        }
+    }
+
+    found_results.sort_by_key(|pr| pr.rtt);
+    found_results.truncate(want);
+    Ok(found_results)
+}
+
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,

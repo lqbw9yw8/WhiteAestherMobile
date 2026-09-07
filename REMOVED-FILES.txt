@@ -1,0 +1,4 @@
+native/aether/aether/src/bin/aether.rs  -- deleted (see chat summary: this file
+duplicated the "aether" binary name already declared in Cargo.toml's [[bin]]
+entry pointing at src/main.rs, and called aether::run_cli(), a function that
+does not exist anywhere in the crate. It could not have compiled or run.)

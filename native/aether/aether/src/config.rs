@@ -211,6 +211,21 @@ pub fn save(path: &str, identity: &Identity) -> Result<()> {
     write_private(path, &text)
 }
 
+/// Renders an identity the same way [`save`] does, without touching disk --
+/// for embedding inside a larger text blob such as an identity export.
+pub fn to_text(identity: &Identity) -> Result<String> {
+    let persisted = PersistedIdentity::from(identity);
+    toml::to_string_pretty(&persisted).map_err(|e| AetherError::Other(format!("config encode: {e}")))
+}
+
+/// Reads an identity out of a text blob rather than a file -- the inverse of
+/// [`to_text`], used when importing an identity export.
+pub fn parse(text: &str) -> Result<Identity> {
+    let persisted: PersistedIdentity =
+        toml::from_str(text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
+    Identity::try_from(persisted).map_err(|e| AetherError::Other(format!("{e}")))
+}
+
 pub fn save_masque_creds(
     path: &str,
     cert_pem: &[u8],
